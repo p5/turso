@@ -3302,7 +3302,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // This lets recovery merge checkpointed sqlite_schema rows with non-checkpointed rows from log replay.
         // Return value indicates whether recovery replayed any frames; unused here because
         // global_header initialization below is unconditional (guarded by is_none() instead).
-        // The return value is still used by tests to verify recovery behavior.
         let _recovered = self.maybe_recover_logical_log(bootstrap_conn.clone())?;
 
         // Recovery is done, switch back to regular MVCC reads.
