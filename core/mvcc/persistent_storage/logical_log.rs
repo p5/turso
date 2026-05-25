@@ -1239,9 +1239,7 @@ impl StreamingLogicalLogReader {
 
     /// Reads the next complete transaction frame.
     ///
-    /// Recovery needs the whole frame so it can decide which schema snapshot should decode each
-    /// index op. Empty parsed frames are skipped, so callers that receive Some(frame) can
-    /// rely on `frame` being non-empty.
+    /// Empty parsed frames are skipped, so callers that receive Some(frame) can rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
         loop {
             match self.state {
