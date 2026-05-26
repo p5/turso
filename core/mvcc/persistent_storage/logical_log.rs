@@ -1304,8 +1304,8 @@ impl StreamingLogicalLogReader {
 
         loop {
             match self.state {
-                StreamingState::ParsingFrameHeader {} => {
-                    self.parse_frame_header(&io)?;
+                StreamingState::ParsingFrameHeader => {
+                    self.parse_frame_header(io)?;
                 }
                 StreamingState::ParsingRecord { .. } => {
                     match self.parse_next_record(io)? {
@@ -1316,20 +1316,17 @@ impl StreamingLogicalLogReader {
                     };
                 }
                 StreamingState::ParsingFrameTrailer { .. } => {
-                    match self.parse_frame_trailer(&io)? {
-                        IOResult::Done(_) => {}
-                        IOResult::IO(completion) => {
-                            completion.wait(io.as_ref())?;
+                    match self.parse_frame_trailer(io)? {
+                        IOResult::Done(_) => {
+                            // skip empty frames
+                            if !parsed_ops.is_empty() {
+                                return Ok(Some(parsed_ops));
+                            }
                         }
+                        IOResult::IO(completion) => completion.wait(io.as_ref())?,
                     };
                 }
-                StreamingState::Finished => {
-                    return if !parsed_ops.is_empty() {
-                        Ok(Some(parsed_ops))
-                    } else {
-                        Ok(None)
-                    };
-                }
+                StreamingState::Finished => return Ok(None),
             }
         }
     }
@@ -1337,9 +1334,17 @@ impl StreamingLogicalLogReader {
     fn parse_frame_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
         let frame_start = self.offset.saturating_sub(self.bytes_can_read());
 
+        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
+            self.state = StreamingState::Finished;
+            return Ok(());
+        }
+
         let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
             Some(bytes) => bytes,
-            None => return Ok(()),
+            None => {
+                self.state = StreamingState::Finished;
+                return Ok(());
+            }
         };
 
         // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
@@ -1351,6 +1356,7 @@ impl StreamingLogicalLogReader {
         ]);
         if frame_magic != FRAME_MAGIC {
             self.last_valid_offset = frame_start;
+            self.state = StreamingState::Finished;
             return Ok(());
         }
         let payload_size_u64 = u64::from_le_bytes([
@@ -1385,6 +1391,7 @@ impl StreamingLogicalLogReader {
             Err(e) => {
                 tracing::warn!("payload_size overflows usize: {e}");
                 self.last_valid_offset = frame_start;
+                self.state = StreamingState::Finished;
                 return Ok(());
             }
         };
@@ -1399,11 +1406,19 @@ impl StreamingLogicalLogReader {
         // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
         self.running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
 
-        self.state = StreamingState::ParsingRecord {
-            record_idx: 0,
-            payload_bytes_read: 0,
-            frame_info,
-            header_bytes,
+        self.state = if op_count == 0 {
+            // empty frame (legal)
+            StreamingState::ParsingFrameTrailer {
+                frame_info,
+                payload_bytes_read: 0,
+            }
+        } else {
+            StreamingState::ParsingRecord {
+                record_idx: 0,
+                payload_bytes_read: 0,
+                frame_info,
+                header_bytes,
+            }
         };
 
         Ok(())
@@ -1420,11 +1435,13 @@ impl StreamingLogicalLogReader {
             ));
         };
 
-        if frame_info.payload_size as usize != payload_bytes_read {
-            return Err(LimboError::Corrupt(format!(
+        if frame_info.payload_size != payload_bytes_read {
+            tracing::warn!(
                 "payload_size ({}) != payload_bytes_read ({payload_bytes_read})",
                 frame_info.payload_size,
-            )));
+            );
+            self.last_valid_offset = frame_info.start;
+            return_empty!(self);
         }
 
         // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
@@ -1456,6 +1473,7 @@ impl StreamingLogicalLogReader {
         }
 
         self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
+        self.state = StreamingState::ParsingFrameHeader;
         Ok(IOResult::Done(()))
     }
 
@@ -2016,9 +2034,10 @@ impl StreamingLogicalLogReader {
             Err(e) => return Err(e),
         };
 
-        self.state = if record_idx < frame_info.op_count as usize {
+        let next_record_idx = record_idx + 1;
+        self.state = if next_record_idx < frame_info.op_count as usize {
             StreamingState::ParsingRecord {
-                record_idx,
+                record_idx: next_record_idx,
                 payload_bytes_read,
                 header_bytes,
                 frame_info,
