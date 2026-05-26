@@ -267,9 +267,12 @@ const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
-const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
+pub(crate) const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
+
+/// Total bytes pre-reserved at the front of a `LogRecord::buf`.
+pub(crate) const LOG_RECORD_PREFIX_SIZE: usize = LOG_HDR_SIZE + TX_HEADER_SIZE;
 
 fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
     if payload_size == 0 {
@@ -487,7 +490,6 @@ pub struct LogicalLog {
     pub file: Arc<dyn File>,
     io: Arc<dyn crate::IO>,
     pub offset: u64,
-    write_buf: Vec<u8>,
     header: Option<LogHeader>,
     /// Running CRC state for chained checksums. Seeded from the header salt;
     /// updated after each committed frame. The next frame's CRC is computed as
@@ -501,8 +503,6 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
-    /// Reusable scratch buffer for ops serialization on the encrypted write path.
-    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
@@ -516,13 +516,11 @@ impl LogicalLog {
             file,
             io,
             offset: 0,
-            write_buf: Vec::new(),
             header: None,
             running_crc: 0,
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
-            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -557,149 +555,73 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
-    /// Serializes a transaction into `write_buf`, optionally calls
-    /// `on_serialization_complete` with a zero-copy reference to the frame bytes.
+    /// Wraps the pre-serialized payload (`tx.buf`) with the log/TX framing
+    /// — optional log header, TX header, optional chunked encryption, CRC
+    /// trailer — and pwrites the resulting frame to disk.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
     /// until `advance_offset_after_success` is called (MVCC commit path).
-    fn serialize_and_pwrite_tx(
+    fn frame_and_pwrite_tx(
         &mut self,
-        tx: &LogRecord,
+        mut tx: LogRecord,
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.write_buf.clear();
-
-        // 1. Serialize log header if it's first write
-        let is_first_write = self.offset == 0;
-        if is_first_write {
-            if self.header.is_none() {
-                let header = LogHeader::new(&self.io);
-                self.running_crc = derive_initial_crc(header.salt);
-                self.header = Some(header);
-            }
-            let header_bytes = self.header.as_ref().unwrap().encode();
-            self.write_buf.extend_from_slice(&header_bytes);
-        }
-
-        // 2. Serialize Transaction header.
-        // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
-        // payload_size is only known after serializing all ops. We reserve TX_HEADER_SIZE bytes
-        // as a placeholder and backfill all header fields in step 4.
-        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
-            .map_err(|_| {
-                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
-            })?;
+        let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
-        let tx_header_start = self.write_buf.len();
-        self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
-
-        // 3. Serialize ops into write_buf (encrypted or plaintext).
-        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
-        let payload_end = self.write_buf.len();
-
-        // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        self.write_buf[tx_header_start..tx_header_start + 4]
-            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        self.write_buf[tx_header_start + 4..tx_header_start + 12]
-            .copy_from_slice(&payload_size.to_le_bytes());
-        self.write_buf[tx_header_start + 12..tx_header_start + 16]
-            .copy_from_slice(&op_count.to_le_bytes());
-        self.write_buf[tx_header_start + 16..tx_header_start + 24]
-            .copy_from_slice(&commit_ts.to_le_bytes());
-
-        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
-        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
-        let crc = crc32c::crc32c_append(
-            self.running_crc,
-            &self.write_buf[tx_header_start..payload_end],
+        // `tx.buf` is laid out as:
+        //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
+        debug_assert!(
+            tx.buf.len() >= LOG_RECORD_PREFIX_SIZE,
+            "LogRecord buf missing pre-reserved framing prefix"
         );
-        self.write_buf.extend_from_slice(&crc.to_le_bytes());
-        self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+        let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
+        let payload_size_u64 = payload_size as u64;
 
-        // 6. Call observer before writing — zero-copy reference into write_buf.
-        if let Some(cb) = on_serialization_complete {
-            cb(&self.write_buf, crc)?;
+        // 1. Ensure we have a log header object (created lazily on first write).
+        let is_first_write = self.offset == 0;
+        if is_first_write && self.header.is_none() {
+            let header = LogHeader::new(&self.io);
+            self.running_crc = derive_initial_crc(header.salt);
+            self.header = Some(header);
         }
 
-        // 7. Hand off the populated buffer to the I/O layer without copying.
-        // `to_vec()` would allocate a second N-byte buffer and memcpy, briefly
-        // holding two full copies in memory — fatal for million-row commits.
-        // `take` swaps in a fresh empty Vec; the next call grows from zero.
-        let buffer = Arc::new(Buffer::new(std::mem::take(&mut self.write_buf)));
-        let c = Completion::new_write({
-            let buffer_len = buffer.len();
-            move |res: Result<i32, CompletionError>| {
-                let Ok(bytes_written) = res else {
-                    return;
-                };
-                turso_assert!(
-                    bytes_written == buffer_len as i32,
-                    "wrote({bytes_written}) != expected({buffer_len})"
-                );
-            }
-        });
-
-        let buffer_len = buffer.len();
-        let c = self.file.pwrite(self.offset, buffer, c)?;
-        if advance_offset_immediately {
-            self.offset += buffer_len as u64;
-            self.running_crc = crc;
-        } else {
-            self.pending_running_crc = Some(crc);
-        }
-        Ok((c, buffer_len as u64))
-    }
-
-    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
-    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
-    ///
-    /// Encrypted on-disk payload layout: repeated
-    /// `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)` chunks.
-    fn serialize_ops_into_write_buf(
-        &mut self,
-        tx: &LogRecord,
-        op_count: u32,
-        commit_ts: u64,
-    ) -> Result<u64> {
+        // 2. Build the on-disk payload. Unencrypted is the zero-shift fast
+        // path: the plaintext is already at LOG_RECORD_PREFIX_SIZE. Encrypted
+        // has to re-emit the payload because its on-disk size differs from
+        // the plaintext size after chunked encryption.
         if let Some(enc_ctx) = &self.encryption_ctx {
-            self.encryption_scratch_buffer.clear();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
-            }
-            if let Some(hdr) = tx.header {
-                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
-            }
-            let payload_size = self.encryption_scratch_buffer.len();
-
             let salt = self
                 .header
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            let total_on_disk_size = encrypted_payload_blob_size(
+            let on_disk_payload_size = encrypted_payload_blob_size(
                 payload_size,
                 self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
             )?;
-            let write_buf_start = self.write_buf.len();
-            self.write_buf.reserve(total_on_disk_size);
+            let total = LOG_RECORD_PREFIX_SIZE + on_disk_payload_size + TX_TRAILER_SIZE;
+            // Move the plaintext out (`split_off` returns the tail past the
+            // framing prefix; `tx.buf` is left with just the 80-byte prefix
+            // to grow back into with encrypted chunks).
+            let plaintext = tx.buf.split_off(LOG_RECORD_PREFIX_SIZE);
+            debug_assert_eq!(plaintext.len(), payload_size);
+            tx.buf.reserve(total - tx.buf.len());
+
             let chunk_count =
                 encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
-
-            let payload_size = payload_size as u64;
-            for (chunk_index, plaintext_chunk) in self
-                .encryption_scratch_buffer
+            let payload_start = tx.buf.len();
+            for (chunk_index, plaintext_chunk) in plaintext
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
                 let is_last_chunk = chunk_index + 1 == chunk_count;
                 let aad = build_encrypted_chunk_aad(
                     salt,
-                    is_last_chunk.then_some(payload_size),
+                    is_last_chunk.then_some(payload_size_u64),
                     op_count,
                     commit_ts,
                     u32::try_from(chunk_index).map_err(|_| {
@@ -708,7 +630,6 @@ impl LogicalLog {
                         )
                     })?,
                 );
-
                 let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
                 // encrypt_chunk returns ciphertext with the auth tag appended, so its
                 // length must be exactly plaintext_len + tag_size. The read path relies
@@ -721,30 +642,87 @@ impl LogicalLog {
                     enc_ctx.tag_size(),
                     ciphertext.len(),
                 );
-                self.write_buf.extend_from_slice(&ciphertext);
-                self.write_buf.extend_from_slice(&nonce);
+                tx.buf.extend_from_slice(&ciphertext);
+                tx.buf.extend_from_slice(&nonce);
             }
             turso_assert!(
-                self.write_buf.len() - write_buf_start == total_on_disk_size,
-                "encrypted write_buf size mismatch"
+                tx.buf.len() - payload_start == on_disk_payload_size,
+                "encrypted on-disk payload size mismatch"
             );
-            Ok(payload_size)
-        } else {
-            let payload_start = self.write_buf.len();
-            for row_version in &tx.row_versions {
-                serialize_op_entry(&mut self.write_buf, row_version)?;
-            }
-            if let Some(header) = tx.header {
-                serialize_header_entry(&mut self.write_buf, &header);
-            }
-            Ok((self.write_buf.len() - payload_start) as u64)
+            // `plaintext` is dropped here, freeing its allocation before pwrite.
         }
+        // Unencrypted: payload bytes are already in place at
+        // [LOG_RECORD_PREFIX_SIZE ..].
+
+        // 3. Backfill TX HEADER at offset LOG_HDR_SIZE:
+        //    FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let tx_header_start = LOG_HDR_SIZE;
+        tx.buf[tx_header_start..tx_header_start + 4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        tx.buf[tx_header_start + 4..tx_header_start + 12]
+            .copy_from_slice(&payload_size_u64.to_le_bytes());
+        tx.buf[tx_header_start + 12..tx_header_start + 16].copy_from_slice(&op_count.to_le_bytes());
+        tx.buf[tx_header_start + 16..tx_header_start + 24]
+            .copy_from_slice(&commit_ts.to_le_bytes());
+
+        // 4. TX TRAILER (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        // CRC is chained: seeded from running_crc (salt-derived, or previous
+        // frame's CRC), covers TX_HEADER (24 B) + payload (encrypted or plain).
+        // The log header is NOT part of the CRC chain — it has its own header
+        // CRC stored within its 56 bytes.
+        let payload_end = tx.buf.len();
+        let crc = crc32c::crc32c_append(self.running_crc, &tx.buf[tx_header_start..payload_end]);
+        tx.buf.extend_from_slice(&crc.to_le_bytes());
+        tx.buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+
+        // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
+        // commits leave it as zeros; those bytes never reach disk because
+        // we wrap the buffer with `new_with_start(..., LOG_HDR_SIZE)` below.
+        if is_first_write {
+            let header_bytes = self.header.as_ref().unwrap().encode();
+            tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
+        }
+
+        // 6. Observer hook: gets a zero-copy reference into the on-disk bytes.
+        let on_disk_start = if is_first_write { 0 } else { LOG_HDR_SIZE };
+        if let Some(cb) = on_serialization_complete {
+            cb(&tx.buf[on_disk_start..], crc)?;
+        }
+
+        // 7. Hand off `tx.buf` to the I/O layer without copying. For
+        // non-first-write commits, the Buffer wrapper exposes only
+        // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
+        // disk — a single pwrite, no shift.
+        let raw = tx.buf;
+        let buffer = if is_first_write {
+            Arc::new(Buffer::new(raw))
+        } else {
+            Arc::new(Buffer::new_with_start(raw, LOG_HDR_SIZE))
+        };
+        let buffer_len = buffer.len();
+        let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
+            let Ok(bytes_written) = res else {
+                return;
+            };
+            turso_assert!(
+                bytes_written == buffer_len as i32,
+                "wrote({bytes_written}) != expected({buffer_len})"
+            );
+        });
+
+        let c = self.file.pwrite(self.offset, buffer, c)?;
+        if advance_offset_immediately {
+            self.offset += buffer_len as u64;
+            self.running_crc = crc;
+        } else {
+            self.pending_running_crc = Some(crc);
+        }
+        Ok((c, buffer_len as u64))
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
-    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
-        let (c, _) = self.serialize_and_pwrite_tx(tx, true, None)?;
+    pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
+        let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
         Ok(c)
     }
 
@@ -753,14 +731,14 @@ impl LogicalLog {
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
     /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the serialized frame bytes and the running CRC after
-    /// serialization but before the disk write.
+    /// reference to the framed bytes and the running CRC after framing but
+    /// before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
-        tx: &LogRecord,
+        tx: LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
+        self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -848,7 +826,7 @@ impl LogicalLog {
 
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+pub(crate) fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
@@ -914,7 +892,7 @@ fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<
     Ok(())
 }
 
-fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
     buffer.push(OP_UPDATE_HEADER);
     buffer.push(0);
@@ -1161,9 +1139,6 @@ pub struct StreamingLogicalLogReader {
     buffer_offset: usize,
     file_size: usize,
     state: StreamingState,
-    /// Buffer of parsed ops from the current transaction frame. `next_frame`
-    /// fills this; `next_record` drains one op at a time. Empty between transactions.
-    pending_ops: std::collections::VecDeque<ParsedOp>,
     /// Byte offset of the end of the last fully validated transaction frame. Used during
     /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
@@ -1206,7 +1181,6 @@ impl StreamingLogicalLogReader {
             buffer_offset: 0,
             file_size,
             state: StreamingState::ParsingFrameHeader,
-            pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
             encryption_ctx,
@@ -2353,8 +2327,9 @@ struct EncryptedPayloadReadContext {
 /// back to `next_frame` without duplicating control flow.
 ///
 /// Corruption is signalled via `Err(LimboError::Corrupt(...))`, not a variant here.
-/// The caller (`next_frame`) catches those errors and converts them to
-/// `ParseResult::InvalidFrame` to preserve the WAL-prefix "stop scanning" semantics.
+/// The caller (`next_frame`) catches those errors and treats them as an invalid
+/// frame (stop scanning, keep previously validated frames) — same as EOF for the
+/// caller, but with `last_valid_offset` set to the start of the invalid frame.
 enum PayloadParseResult {
     /// Successfully parsed ops and updated running CRC.
     Ok(Vec<ParsedOp>, u32),
@@ -2368,19 +2343,6 @@ enum PayloadParseResult {
 enum EncryptedChunkReadResult {
     Ok { running_crc: u32 },
     Eof,
-}
-
-#[cfg_attr(test, derive(Debug))]
-enum ParseResult {
-    /// A fully validated transaction frame was parsed.
-    Ops(Vec<ParsedOp>),
-    /// True end-of-file: not enough bytes remain to form a complete frame.
-    Eof,
-    /// An invalid frame was encountered (bad magic, CRC mismatch, structural error).
-    /// Handled the same as EOF (stop scanning, keep previously validated frames),
-    /// but semantically distinct: the data exists but is not a valid frame.
-    /// `last_valid_offset` is set to the start of the invalid frame before returning this.
-    InvalidFrame,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -2451,7 +2413,7 @@ mod tests {
     use super::{
         build_encrypted_chunk_aad, encrypted_chunk_blob_size, encrypted_chunk_plaintext_len,
         encrypted_payload_blob_size, encrypted_payload_chunk_count, serialize_header_entry,
-        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParseResult, ParsedOp,
+        serialize_op_entry, HeaderReadResult, LogHeader, LogicalLog, ParsedOp,
         StreamingLogicalLogReader, ENCRYPTED_CHUNK_AAD_SIZE, ENCRYPTED_PAYLOAD_CHUNK_SIZE,
         END_MAGIC, FRAME_MAGIC, LOG_HDR_CRC_START, LOG_HDR_RESERVED_START, LOG_HDR_SIZE,
         LOG_VERSION, TX_HEADER_SIZE, TX_TRAILER_SIZE,
@@ -4130,18 +4092,8 @@ mod tests {
         let header = reader.header().unwrap();
         assert_eq!(header.salt, salt_after);
 
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::Ops(ops)) => {
-                assert!(!ops.is_empty(), "expected at least one op");
-            }
-            Ok(ParseResult::Eof) => panic!("expected ops, got EOF"),
-            Ok(ParseResult::InvalidFrame) => panic!("expected ops, got InvalidFrame"),
-            Err(e) => panic!("expected ops, got error: {e:?}"),
-        }
-        assert!(matches!(
-            reader.parse_next_transaction(&io),
-            Ok(ParseResult::Eof)
-        ));
+        assert!(!reader.next_frame(&io).unwrap().unwrap().is_empty());
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     /// What this test checks: Corrupting frame 1 in a multi-frame log invalidates frame 2 even
@@ -4169,11 +4121,9 @@ mod tests {
             reader.try_read_header(&io).unwrap(),
             HeaderReadResult::Valid(_)
         ));
-        let mut count = 0;
-        while let Ok(ParseResult::Ops(_)) = reader.parse_next_transaction(&io) {
-            count += 1;
+        for _ in 0..3 {
+            reader.next_frame(&io).unwrap().unwrap();
         }
-        assert_eq!(count, 3);
 
         // Corrupt one byte in frame 1's payload (not the CRC field itself)
         let corrupt_offset = LOG_HDR_SIZE + TX_HEADER_SIZE + 1; // inside frame 1 payload
@@ -4194,10 +4144,7 @@ mod tests {
             HeaderReadResult::Valid(_)
         ));
         // Frame 1 is corrupted — CRC mismatch on structurally complete frame
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::InvalidFrame) => {}
-            other => panic!("expected InvalidFrame after corrupted frame 1, got {other:?}"),
-        }
+        assert!(reader.next_frame(&io).unwrap().is_none());
         // Verify we didn't somehow get frame 2 or 3
         let valid_offset = reader.last_valid_offset();
         assert!(
@@ -4270,18 +4217,10 @@ mod tests {
         ));
 
         // Frame 1 from log A should validate fine
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::Ops(ops)) => assert!(!ops.is_empty()),
-            other => panic!("expected log A's frame to parse, got {other:?}"),
-        }
+        assert!(!reader.next_frame(&io).unwrap().unwrap().is_empty());
 
         // The spliced frame from log B should fail CRC validation
-        match reader.parse_next_transaction(&io) {
-            Ok(ParseResult::InvalidFrame) => {}
-            other => {
-                panic!("spliced frame from a different log should NOT validate, got {other:?}")
-            }
-        }
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
@@ -4578,14 +4517,8 @@ mod tests {
     ) -> Vec<ParsedOp> {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
         reader.read_header(io).unwrap();
-        let ops = match reader.parse_next_transaction(io).unwrap() {
-            ParseResult::Ops(ops) => ops,
-            other => panic!("expected Ops, got {other:?}"),
-        };
-        assert!(matches!(
-            reader.parse_next_transaction(io).unwrap(),
-            ParseResult::Eof
-        ));
+        let ops = reader.next_frame(io).unwrap().unwrap();
+        assert!(reader.next_frame(io).unwrap().is_none());
         ops
     }
 
@@ -4601,14 +4534,8 @@ mod tests {
             encrypted_payload_chunk_size,
         );
         reader.read_header(io).unwrap();
-        let ops = match reader.parse_next_transaction(io).unwrap() {
-            ParseResult::Ops(ops) => ops,
-            other => panic!("expected Ops, got {other:?}"),
-        };
-        assert!(matches!(
-            reader.parse_next_transaction(io).unwrap(),
-            ParseResult::Eof
-        ));
+        let ops = reader.next_frame(io).unwrap().unwrap();
+        assert!(reader.next_frame(io).unwrap().is_none());
         ops
     }
 
@@ -4630,14 +4557,11 @@ mod tests {
         let mut tx_index = 0usize;
         loop {
             match reader
-                .parse_next_transaction(io)
+                .next_frame(io)
                 .map_err(|e| format!("failed to parse fuzz frame {tx_index}: {e}"))?
             {
-                ParseResult::Ops(ops) => frames.push(ops),
-                ParseResult::Eof => break,
-                ParseResult::InvalidFrame => {
-                    return Err(format!("invalid fuzz frame at tx_index={tx_index}"));
-                }
+                Some(ops) => frames.push(ops),
+                None => break,
             }
             tx_index += 1;
         }
@@ -4970,10 +4894,7 @@ mod tests {
     ) {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(io).unwrap();
-        match reader.parse_next_transaction(io).unwrap() {
-            ParseResult::InvalidFrame => {}
-            other => panic!("expected InvalidFrame, got {other:?}"),
-        }
+        assert!(reader.next_frame(io).unwrap().is_none());
     }
 
     /// Write an encrypted frame, verify the on-disk layout invariant
@@ -5047,18 +4968,12 @@ mod tests {
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
 
-        let ops = match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => ops,
-            other => panic!("expected Ops, got {other:?}"),
-        };
+        let ops = reader.next_frame(&io).unwrap().unwrap();
         assert_eq!(ops.len(), 2);
         assert_upsert_table_op(&ops[0], table_id, 1, &expected_hello_record_bytes, 100);
         assert_upsert_table_op(&ops[1], table_id, 2, &expected_world_record_bytes, 100);
 
-        assert!(matches!(
-            reader.parse_next_transaction(&io).unwrap(),
-            ParseResult::Eof
-        ));
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     /// What this test checks: Test-only chunk-size overrides affect both encrypted writing and
@@ -5323,10 +5238,7 @@ mod tests {
 
         let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
         reader.read_header(&io).unwrap();
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::InvalidFrame => {}
-            other => panic!("expected InvalidFrame after payload_size tamper, got {other:?}"),
-        }
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     #[test]
@@ -5593,10 +5505,10 @@ mod tests {
         reader.read_header(&io).unwrap();
 
         for i in 0..5u64 {
-            let ops = match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::Ops(ops) => ops,
-                other => panic!("frame {i}: expected Ops, got {other:?}"),
-            };
+            let ops = reader
+                .next_frame(&io)
+                .unwrap()
+                .unwrap_or_else(|| panic!("frame {i}: expected Some"));
             assert_eq!(ops.len(), 1, "frame {i}");
             assert_upsert_table_op(
                 &ops[0],
@@ -5607,10 +5519,7 @@ mod tests {
             );
         }
 
-        assert!(matches!(
-            reader.parse_next_transaction(&io).unwrap(),
-            ParseResult::Eof
-        ));
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     /// AEAD integrity: wrong key and tampered ciphertext must both be rejected.
@@ -5638,10 +5547,7 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(wrong_key_enc_ctx()));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::InvalidFrame => {}
-                other => panic!("expected InvalidFrame with wrong key, got {other:?}"),
-            }
+            assert!(reader.next_frame(&io).unwrap().is_none());
         }
 
         // ── Tampered TX header (commit_ts) ──
@@ -5671,10 +5577,7 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::InvalidFrame => {}
-                other => panic!("expected InvalidFrame after TX header tamper, got {other:?}"),
-            }
+            assert!(reader.next_frame(&io).unwrap().is_none());
         }
 
         // ── Tampered ciphertext ──
@@ -5702,10 +5605,7 @@ mod tests {
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx));
             reader.read_header(&io).unwrap();
 
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::InvalidFrame => {}
-                other => panic!("expected InvalidFrame after ciphertext tamper, got {other:?}"),
-            }
+            assert!(reader.next_frame(&io).unwrap().is_none());
         }
     }
 
@@ -5743,19 +5643,12 @@ mod tests {
         reader.read_header(&io).unwrap();
 
         // First frame should parse fine.
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Ops(ops) => {
-                assert_eq!(ops.len(), 1);
-                assert_upsert_table_op(&ops[0], (-2).into(), 0, &expected_first_record_bytes, 100);
-            }
-            other => panic!("expected Ops for frame 1, got {other:?}"),
-        }
+        let ops = reader.next_frame(&io).unwrap().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_upsert_table_op(&ops[0], (-2).into(), 0, &expected_first_record_bytes, 100);
 
         // Second frame is torn — should be EOF.
-        match reader.parse_next_transaction(&io).unwrap() {
-            ParseResult::Eof => {}
-            other => panic!("expected Eof for torn frame 2, got {other:?}"),
-        }
+        assert!(reader.next_frame(&io).unwrap().is_none());
     }
 
     // Verifies chunk-level tampering is rejected: any corruption, reorder, drop, or
@@ -5872,10 +5765,7 @@ mod tests {
             if allow_eof {
                 let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
                 reader.read_header(&io).unwrap();
-                match reader.parse_next_transaction(&io).unwrap() {
-                    ParseResult::InvalidFrame | ParseResult::Eof => {}
-                    other => panic!("expected rejection for {label}, got {other:?}"),
-                }
+                assert!(reader.next_frame(&io).unwrap().is_none());
             } else {
                 assert_single_frame_invalid(file, &io, enc_ctx.clone());
             }
@@ -5955,23 +5845,10 @@ mod tests {
 
             let mut reader = StreamingLogicalLogReader::new(file, Some(enc_ctx.clone()));
             reader.read_header(&io).unwrap();
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::Ops(ops) => {
-                    assert_eq!(ops.len(), 1);
-                    assert_upsert_table_op(
-                        &ops[0],
-                        (-2).into(),
-                        1,
-                        &expected_prefix_record_bytes,
-                        500,
-                    );
-                }
-                other => panic!("expected prefix frame to survive, got {other:?}"),
-            }
-            match reader.parse_next_transaction(&io).unwrap() {
-                ParseResult::Eof => {}
-                other => panic!("expected Eof for torn multi-chunk frame, got {other:?}"),
-            }
+            let ops = reader.next_frame(&io).unwrap().unwrap();
+            assert_eq!(ops.len(), 1);
+            assert_upsert_table_op(&ops[0], (-2).into(), 1, &expected_prefix_record_bytes, 500);
+            assert!(reader.next_frame(&io).unwrap().is_none());
         }
 
         // Keep the last chunk variable used so the compiler notices if the range math changes.
