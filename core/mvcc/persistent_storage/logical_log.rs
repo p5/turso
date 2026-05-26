@@ -106,7 +106,7 @@
 //!
 //! ## Validation behavior
 //!
-//! The read path (`parse_next_transaction`) performs strict structural validation (header/trailer
+//! The read path (`next_frame`) performs strict structural validation (header/trailer
 //! fields, reserved bits, table-id sign, op payload shape) plus chained CRC verification.
 //!
 //! Validation is availability-focused, mirroring SQLite WAL prefix semantics:
@@ -218,6 +218,7 @@ use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
+use crate::IOResult;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -229,6 +230,7 @@ use crate::{
 };
 
 use crate::storage::encryption::EncryptionContext;
+use crate::types::IOCompletions;
 use crate::File;
 
 /// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
@@ -265,12 +267,9 @@ const OP_UPDATE_HEADER: u8 = 4;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 
-pub(crate) const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
+const TX_HEADER_SIZE: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
 const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
-
-/// Total bytes pre-reserved at the front of a `LogRecord::buf`.
-pub(crate) const LOG_RECORD_PREFIX_SIZE: usize = LOG_HDR_SIZE + TX_HEADER_SIZE;
 
 fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
     if payload_size == 0 {
@@ -488,6 +487,7 @@ pub struct LogicalLog {
     pub file: Arc<dyn File>,
     io: Arc<dyn crate::IO>,
     pub offset: u64,
+    write_buf: Vec<u8>,
     header: Option<LogHeader>,
     /// Running CRC state for chained checksums. Seeded from the header salt;
     /// updated after each committed frame. The next frame's CRC is computed as
@@ -501,6 +501,8 @@ pub struct LogicalLog {
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
     encrypted_payload_chunk_size: usize,
+    /// Reusable scratch buffer for ops serialization on the encrypted write path.
+    encryption_scratch_buffer: Vec<u8>,
 }
 
 impl LogicalLog {
@@ -514,11 +516,13 @@ impl LogicalLog {
             file,
             io,
             offset: 0,
+            write_buf: Vec::new(),
             header: None,
             running_crc: 0,
             pending_running_crc: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
+            encryption_scratch_buffer: Vec::new(),
         }
     }
 
@@ -553,73 +557,149 @@ impl LogicalLog {
         self.encryption_ctx.as_ref()
     }
 
-    /// Wraps the pre-serialized payload (`tx.buf`) with the log/TX framing
-    /// — optional log header, TX header, optional chunked encryption, CRC
-    /// trailer — and pwrites the resulting frame to disk.
+    /// Serializes a transaction into `write_buf`, optionally calls
+    /// `on_serialization_complete` with a zero-copy reference to the frame bytes.
     ///
     /// `advance_offset_immediately`: when true, the writer offset advances right
     /// after the pwrite (checkpoint path). When false, the offset stays behind
     /// until `advance_offset_after_success` is called (MVCC commit path).
-    fn frame_and_pwrite_tx(
+    fn serialize_and_pwrite_tx(
         &mut self,
-        mut tx: LogRecord,
+        tx: &LogRecord,
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        let op_count = tx.op_count;
-        let commit_ts = tx.tx_timestamp;
-        // `tx.buf` is laid out as:
-        //   [LOG_HDR slot (56B, zeros)] [TX_HEADER slot (24B, zeros)] [payload]
-        debug_assert!(
-            tx.buf.len() >= LOG_RECORD_PREFIX_SIZE,
-            "LogRecord buf missing pre-reserved framing prefix"
-        );
-        let payload_size = tx.buf.len() - LOG_RECORD_PREFIX_SIZE;
-        let payload_size_u64 = payload_size as u64;
+        self.write_buf.clear();
 
-        // 1. Ensure we have a log header object (created lazily on first write).
+        // 1. Serialize log header if it's first write
         let is_first_write = self.offset == 0;
-        if is_first_write && self.header.is_none() {
-            let header = LogHeader::new(&self.io);
-            self.running_crc = derive_initial_crc(header.salt);
-            self.header = Some(header);
+        if is_first_write {
+            if self.header.is_none() {
+                let header = LogHeader::new(&self.io);
+                self.running_crc = derive_initial_crc(header.salt);
+                self.header = Some(header);
+            }
+            let header_bytes = self.header.as_ref().unwrap().encode();
+            self.write_buf.extend_from_slice(&header_bytes);
         }
 
-        // 2. Build the on-disk payload. Unencrypted is the zero-shift fast
-        // path: the plaintext is already at LOG_RECORD_PREFIX_SIZE. Encrypted
-        // has to re-emit the payload because its on-disk size differs from
-        // the plaintext size after chunked encryption.
+        // 2. Serialize Transaction header.
+        // A header-only transaction is encoded as a single OP_UPDATE_HEADER op.
+        // payload_size is only known after serializing all ops. We reserve TX_HEADER_SIZE bytes
+        // as a placeholder and backfill all header fields in step 4.
+        let op_count = u32::try_from(tx.row_versions.len() + usize::from(tx.header.is_some()))
+            .map_err(|_| {
+                LimboError::InternalError("Logical log op_count exceeds u32".to_string())
+            })?;
+        let commit_ts = tx.tx_timestamp;
+        let tx_header_start = self.write_buf.len();
+        self.write_buf.resize(tx_header_start + TX_HEADER_SIZE, 0);
+
+        // 3. Serialize ops into write_buf (encrypted or plaintext).
+        let payload_size = self.serialize_ops_into_write_buf(tx, op_count, commit_ts)?;
+        let payload_end = self.write_buf.len();
+
+        // 4. Backfill TX HEADER: FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        self.write_buf[tx_header_start..tx_header_start + 4]
+            .copy_from_slice(&FRAME_MAGIC.to_le_bytes());
+        self.write_buf[tx_header_start + 4..tx_header_start + 12]
+            .copy_from_slice(&payload_size.to_le_bytes());
+        self.write_buf[tx_header_start + 12..tx_header_start + 16]
+            .copy_from_slice(&op_count.to_le_bytes());
+        self.write_buf[tx_header_start + 16..tx_header_start + 24]
+            .copy_from_slice(&commit_ts.to_le_bytes());
+
+        // 5. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        // CRC is chained: seeded from running_crc (salt-derived, or previous frame's CRC),
+        // covers TX_HEADER (24 B) + payload (encrypted or plaintext).
+        let crc = crc32c::crc32c_append(
+            self.running_crc,
+            &self.write_buf[tx_header_start..payload_end],
+        );
+        self.write_buf.extend_from_slice(&crc.to_le_bytes());
+        self.write_buf.extend_from_slice(&END_MAGIC.to_le_bytes());
+
+        // 6. Call observer before writing — zero-copy reference into write_buf.
+        if let Some(cb) = on_serialization_complete {
+            cb(&self.write_buf, crc)?;
+        }
+
+        // 7. Hand off the populated buffer to the I/O layer without copying.
+        // `to_vec()` would allocate a second N-byte buffer and memcpy, briefly
+        // holding two full copies in memory — fatal for million-row commits.
+        // `take` swaps in a fresh empty Vec; the next call grows from zero.
+        let buffer = Arc::new(Buffer::new(std::mem::take(&mut self.write_buf)));
+        let c = Completion::new_write({
+            let buffer_len = buffer.len();
+            move |res: Result<i32, CompletionError>| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                turso_assert!(
+                    bytes_written == buffer_len as i32,
+                    "wrote({bytes_written}) != expected({buffer_len})"
+                );
+            }
+        });
+
+        let buffer_len = buffer.len();
+        let c = self.file.pwrite(self.offset, buffer, c)?;
+        if advance_offset_immediately {
+            self.offset += buffer_len as u64;
+            self.running_crc = crc;
+        } else {
+            self.pending_running_crc = Some(crc);
+        }
+        Ok((c, buffer_len as u64))
+    }
+
+    /// Serializes ops into `write_buf`, encrypting if an encryption context is set.
+    /// Returns the plaintext payload size (used in the TX header's `payload_size` field).
+    ///
+    /// Encrypted on-disk payload layout: repeated
+    /// `ciphertext(chunk_plain_len + tag_size) | nonce(nonce_size)` chunks.
+    fn serialize_ops_into_write_buf(
+        &mut self,
+        tx: &LogRecord,
+        op_count: u32,
+        commit_ts: u64,
+    ) -> Result<u64> {
         if let Some(enc_ctx) = &self.encryption_ctx {
+            self.encryption_scratch_buffer.clear();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.encryption_scratch_buffer, row_version)?;
+            }
+            if let Some(hdr) = tx.header {
+                serialize_header_entry(&mut self.encryption_scratch_buffer, &hdr);
+            }
+            let payload_size = self.encryption_scratch_buffer.len();
+
             let salt = self
                 .header
                 .as_ref()
                 .expect("log header must be set before writing")
                 .salt;
-            let on_disk_payload_size = encrypted_payload_blob_size(
+            let total_on_disk_size = encrypted_payload_blob_size(
                 payload_size,
                 self.encrypted_payload_chunk_size,
                 enc_ctx.tag_size(),
                 enc_ctx.nonce_size(),
             )?;
-            let total = LOG_RECORD_PREFIX_SIZE + on_disk_payload_size + TX_TRAILER_SIZE;
-            // Move the plaintext out (`split_off` returns the tail past the
-            // framing prefix; `tx.buf` is left with just the 80-byte prefix
-            // to grow back into with encrypted chunks).
-            let plaintext = tx.buf.split_off(LOG_RECORD_PREFIX_SIZE);
-            debug_assert_eq!(plaintext.len(), payload_size);
-            tx.buf.reserve(total - tx.buf.len());
-
+            let write_buf_start = self.write_buf.len();
+            self.write_buf.reserve(total_on_disk_size);
             let chunk_count =
                 encrypted_payload_chunk_count(payload_size, self.encrypted_payload_chunk_size);
-            let payload_start = tx.buf.len();
-            for (chunk_index, plaintext_chunk) in plaintext
+
+            let payload_size = payload_size as u64;
+            for (chunk_index, plaintext_chunk) in self
+                .encryption_scratch_buffer
                 .chunks(self.encrypted_payload_chunk_size)
                 .enumerate()
             {
                 let is_last_chunk = chunk_index + 1 == chunk_count;
                 let aad = build_encrypted_chunk_aad(
                     salt,
-                    is_last_chunk.then_some(payload_size_u64),
+                    is_last_chunk.then_some(payload_size),
                     op_count,
                     commit_ts,
                     u32::try_from(chunk_index).map_err(|_| {
@@ -628,6 +708,7 @@ impl LogicalLog {
                         )
                     })?,
                 );
+
                 let (ciphertext, nonce) = enc_ctx.encrypt_chunk(plaintext_chunk, &aad)?;
                 // encrypt_chunk returns ciphertext with the auth tag appended, so its
                 // length must be exactly plaintext_len + tag_size. The read path relies
@@ -640,87 +721,30 @@ impl LogicalLog {
                     enc_ctx.tag_size(),
                     ciphertext.len(),
                 );
-                tx.buf.extend_from_slice(&ciphertext);
-                tx.buf.extend_from_slice(&nonce);
+                self.write_buf.extend_from_slice(&ciphertext);
+                self.write_buf.extend_from_slice(&nonce);
             }
             turso_assert!(
-                tx.buf.len() - payload_start == on_disk_payload_size,
-                "encrypted on-disk payload size mismatch"
+                self.write_buf.len() - write_buf_start == total_on_disk_size,
+                "encrypted write_buf size mismatch"
             );
-            // `plaintext` is dropped here, freeing its allocation before pwrite.
-        }
-        // Unencrypted: payload bytes are already in place at
-        // [LOG_RECORD_PREFIX_SIZE ..].
-
-        // 3. Backfill TX HEADER at offset LOG_HDR_SIZE:
-        //    FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        let tx_header_start = LOG_HDR_SIZE;
-        tx.buf[tx_header_start..tx_header_start + 4].copy_from_slice(&FRAME_MAGIC.to_le_bytes());
-        tx.buf[tx_header_start + 4..tx_header_start + 12]
-            .copy_from_slice(&payload_size_u64.to_le_bytes());
-        tx.buf[tx_header_start + 12..tx_header_start + 16].copy_from_slice(&op_count.to_le_bytes());
-        tx.buf[tx_header_start + 16..tx_header_start + 24]
-            .copy_from_slice(&commit_ts.to_le_bytes());
-
-        // 4. TX TRAILER (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        // CRC is chained: seeded from running_crc (salt-derived, or previous
-        // frame's CRC), covers TX_HEADER (24 B) + payload (encrypted or plain).
-        // The log header is NOT part of the CRC chain — it has its own header
-        // CRC stored within its 56 bytes.
-        let payload_end = tx.buf.len();
-        let crc = crc32c::crc32c_append(self.running_crc, &tx.buf[tx_header_start..payload_end]);
-        tx.buf.extend_from_slice(&crc.to_le_bytes());
-        tx.buf.extend_from_slice(&END_MAGIC.to_le_bytes());
-
-        // 5. Fill the LOG_HDR slot (first-write only). Non-first-write
-        // commits leave it as zeros; those bytes never reach disk because
-        // we wrap the buffer with `new_with_start(..., LOG_HDR_SIZE)` below.
-        if is_first_write {
-            let header_bytes = self.header.as_ref().unwrap().encode();
-            tx.buf[..LOG_HDR_SIZE].copy_from_slice(&header_bytes);
-        }
-
-        // 6. Observer hook: gets a zero-copy reference into the on-disk bytes.
-        let on_disk_start = if is_first_write { 0 } else { LOG_HDR_SIZE };
-        if let Some(cb) = on_serialization_complete {
-            cb(&tx.buf[on_disk_start..], crc)?;
-        }
-
-        // 7. Hand off `tx.buf` to the I/O layer without copying. For
-        // non-first-write commits, the Buffer wrapper exposes only
-        // `data[LOG_HDR_SIZE..]` so the unused 56-byte prefix never reaches
-        // disk — a single pwrite, no shift.
-        let raw = tx.buf;
-        let buffer = if is_first_write {
-            Arc::new(Buffer::new(raw))
+            Ok(payload_size)
         } else {
-            Arc::new(Buffer::new_with_start(raw, LOG_HDR_SIZE))
-        };
-        let buffer_len = buffer.len();
-        let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
-            let Ok(bytes_written) = res else {
-                return;
-            };
-            turso_assert!(
-                bytes_written == buffer_len as i32,
-                "wrote({bytes_written}) != expected({buffer_len})"
-            );
-        });
-
-        let c = self.file.pwrite(self.offset, buffer, c)?;
-        if advance_offset_immediately {
-            self.offset += buffer_len as u64;
-            self.running_crc = crc;
-        } else {
-            self.pending_running_crc = Some(crc);
+            let payload_start = self.write_buf.len();
+            for row_version in &tx.row_versions {
+                serialize_op_entry(&mut self.write_buf, row_version)?;
+            }
+            if let Some(header) = tx.header {
+                serialize_header_entry(&mut self.write_buf, &header);
+            }
+            Ok((self.write_buf.len() - payload_start) as u64)
         }
-        Ok((c, buffer_len as u64))
     }
 
     /// Writes a transaction to the log and immediately advances the writer offset.
     /// Used for checkpoint-initiated writes where no two-phase commit is needed.
-    pub fn log_tx(&mut self, tx: LogRecord) -> Result<Completion> {
-        let (c, _) = self.frame_and_pwrite_tx(tx, true, None)?;
+    pub fn log_tx(&mut self, tx: &LogRecord) -> Result<Completion> {
+        let (c, _) = self.serialize_and_pwrite_tx(tx, true, None)?;
         Ok(c)
     }
 
@@ -729,14 +753,14 @@ impl LogicalLog {
     /// `advance_offset_after_success(bytes)` after confirming the commit succeeded.
     ///
     /// If `on_serialization_complete` is provided, it is called with a zero-copy
-    /// reference to the framed bytes and the running CRC after framing but
-    /// before the disk write.
+    /// reference to the serialized frame bytes and the running CRC after
+    /// serialization but before the disk write.
     pub fn log_tx_deferred_offset(
         &mut self,
-        tx: LogRecord,
+        tx: &LogRecord,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
-        self.frame_and_pwrite_tx(tx, false, on_serialization_complete)
+        self.serialize_and_pwrite_tx(tx, false, on_serialization_complete)
     }
 
     pub fn advance_offset_after_success(&mut self, bytes: u64) {
@@ -824,7 +848,7 @@ impl LogicalLog {
 
 /// Serialize one op into `buffer`.
 /// Op layout: tag(1) | flags(1) | table_id(4, le i32) | payload_len(varint) | payload(variable)
-pub(crate) fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
+fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion) -> Result<()> {
     let is_delete = row_version.end.is_some();
     let tag = match (&row_version.row.id.row_id, is_delete) {
         (RowKey::Int(_), false) => OP_UPSERT_TABLE,
@@ -890,7 +914,7 @@ pub(crate) fn serialize_op_entry(buffer: &mut Vec<u8>, row_version: &RowVersion)
     Ok(())
 }
 
-pub(crate) fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
+fn serialize_header_entry(buffer: &mut Vec<u8>, header: &DatabaseHeader) {
     // Header op uses tag-only addressing (table_id=0, flags=0) and fixed payload length.
     buffer.push(OP_UPDATE_HEADER);
     buffer.push(0);
@@ -1086,9 +1110,32 @@ pub enum StreamingResult {
     Eof,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum StreamingState {
-    NeedTransactionStart,
+    /// We are positioned at the start of a transaction frame. This state parses frame metadata.
+    ParsingFrameHeader,
+    /// We are parsing a record in a transaction frame. The reader then transitions to
+    /// [Self::ParsingFrameHeader] if there are more frames to parse, and [Self::Finished] otherwise.
+    ParsingRecord {
+        record_idx: usize,
+        payload_bytes_read: usize,
+        header_bytes: [u8; TX_HEADER_SIZE],
+        frame_info: FrameInfo,
+    },
+    ParsingFrameTrailer {
+        frame_info: FrameInfo,
+        payload_bytes_read: usize,
+    },
+    /// The complete logical log has been parsed
+    Finished,
+}
+
+#[derive(Debug)]
+struct FrameInfo {
+    start: usize,
+    payload_size: usize,
+    op_count: u32,
+    commit_ts: u64,
 }
 
 /// Result of attempting to read and validate the logical log file header.
@@ -1114,6 +1161,9 @@ pub struct StreamingLogicalLogReader {
     buffer_offset: usize,
     file_size: usize,
     state: StreamingState,
+    /// Buffer of parsed ops from the current transaction frame. `next_frame`
+    /// fills this; `next_record` drains one op at a time. Empty between transactions.
+    pending_ops: std::collections::VecDeque<ParsedOp>,
     /// Byte offset of the end of the last fully validated transaction frame. Used during
     /// recovery to set the writer offset so that torn-tail bytes are overwritten on next append.
     last_valid_offset: usize,
@@ -1127,6 +1177,14 @@ pub struct StreamingLogicalLogReader {
     // Reused scratch buffer for decrypted chunk plaintext. Kept on the reader so encrypted
     // recovery can reuse the allocation across chunks and transaction frames.
     decrypt_scratch: Vec<u8>,
+}
+
+//TODO move into a module
+macro_rules! return_empty {
+    ($self: ident) => {{
+        $self.state = StreamingState::Finished;
+        return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+    }};
 }
 
 impl StreamingLogicalLogReader {
@@ -1147,7 +1205,8 @@ impl StreamingLogicalLogReader {
             buffer: Arc::new(RwLock::new(Vec::with_capacity(4096))),
             buffer_offset: 0,
             file_size,
-            state: StreamingState::NeedTransactionStart,
+            state: StreamingState::ParsingFrameHeader,
+            pending_ops: std::collections::VecDeque::new(),
             last_valid_offset: 0,
             running_crc: 0,
             encryption_ctx,
@@ -1186,7 +1245,7 @@ impl StreamingLogicalLogReader {
         self.running_crc
     }
 
-    pub fn read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
+    fn read_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
         match self.try_read_header(io)? {
             HeaderReadResult::Valid(_) => Ok(()),
             HeaderReadResult::NoLog => Err(LimboError::Corrupt(
@@ -1241,25 +1300,163 @@ impl StreamingLogicalLogReader {
     ///
     /// Empty parsed frames are skipped, so callers that receive Some(frame) can rely on `frame` being non-empty.
     pub(crate) fn next_frame(&mut self, io: &Arc<dyn crate::IO>) -> Result<Option<Vec<ParsedOp>>> {
+        let mut parsed_ops = Vec::new();
+
         loop {
             match self.state {
-                StreamingState::NeedTransactionStart => {
-                    if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-                        return Ok(None);
-                    }
-
-                    let ops = match self.parse_next_transaction(io)? {
-                        ParseResult::Ops(ops) => ops,
-                        ParseResult::Eof | ParseResult::InvalidFrame => return Ok(None),
+                StreamingState::ParsingFrameHeader {} => {
+                    self.parse_frame_header(&io)?;
+                }
+                StreamingState::ParsingRecord { .. } => {
+                    match self.parse_next_record(io)? {
+                        IOResult::Done(parsed_op) => {
+                            parsed_ops.push(parsed_op);
+                        }
+                        IOResult::IO(completions) => completions.wait(io.as_ref())?,
                     };
-
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    return Ok(Some(ops));
+                }
+                StreamingState::ParsingFrameTrailer { .. } => {
+                    match self.parse_frame_trailer(&io)? {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(completion) => {
+                            completion.wait(io.as_ref())?;
+                        }
+                    };
+                }
+                StreamingState::Finished => {
+                    return if !parsed_ops.is_empty() {
+                        Ok(Some(parsed_ops))
+                    } else {
+                        Ok(None)
+                    };
                 }
             }
         }
+    }
+
+    fn parse_frame_header(&mut self, io: &Arc<dyn crate::IO>) -> Result<()> {
+        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
+
+        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
+            Some(bytes) => bytes,
+            None => return Ok(()),
+        };
+
+        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
+        let frame_magic = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        if frame_magic != FRAME_MAGIC {
+            self.last_valid_offset = frame_start;
+            return Ok(());
+        }
+        let payload_size_u64 = u64::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let op_count = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let commit_ts = u64::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+            header_bytes[20],
+            header_bytes[21],
+            header_bytes[22],
+            header_bytes[23],
+        ]);
+
+        let payload_size = match usize::try_from(payload_size_u64) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("payload_size overflows usize: {e}");
+                self.last_valid_offset = frame_start;
+                return Ok(());
+            }
+        };
+
+        let frame_info = FrameInfo {
+            start: frame_start,
+            payload_size,
+            op_count,
+            commit_ts,
+        };
+
+        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
+        self.running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+
+        self.state = StreamingState::ParsingRecord {
+            record_idx: 0,
+            payload_bytes_read: 0,
+            frame_info,
+            header_bytes,
+        };
+
+        Ok(())
+    }
+
+    fn parse_frame_trailer(&mut self, io: &Arc<dyn crate::IO>) -> Result<IOResult<()>> {
+        let StreamingState::ParsingFrameTrailer {
+            frame_info,
+            payload_bytes_read,
+        } = std::mem::replace(&mut self.state, StreamingState::Finished)
+        else {
+            return Err(LimboError::InternalError(
+                "unexpected state in parse_next_record".to_string(),
+            ));
+        };
+
+        if frame_info.payload_size as usize != payload_bytes_read {
+            return Err(LimboError::Corrupt(format!(
+                "payload_size ({}) != payload_bytes_read ({payload_bytes_read})",
+                frame_info.payload_size,
+            )));
+        }
+
+        // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
+        let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
+            Some(bytes) => bytes,
+            None => return_empty!(self),
+        };
+
+        let crc32c_expected = u32::from_le_bytes([
+            trailer_bytes[0],
+            trailer_bytes[1],
+            trailer_bytes[2],
+            trailer_bytes[3],
+        ]);
+        let end_magic = u32::from_le_bytes([
+            trailer_bytes[4],
+            trailer_bytes[5],
+            trailer_bytes[6],
+            trailer_bytes[7],
+        ]);
+
+        if crc32c_expected != self.running_crc {
+            self.last_valid_offset = frame_info.start;
+            return_empty!(self);
+        }
+        if end_magic != END_MAGIC {
+            self.last_valid_offset = frame_info.start;
+            return_empty!(self);
+        }
+
+        self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
+        Ok(IOResult::Done(()))
     }
 
     pub fn is_eof(&self) -> bool {
@@ -1623,287 +1820,217 @@ impl StreamingLogicalLogReader {
         Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
     }
 
-    /// Parse an unencrypted payload via field-by-field streaming IO reads.
-    fn parse_streaming_payload(
+    /// Parse a single ParsedOp.
+    fn parse_op(
         &mut self,
         io: &Arc<dyn crate::IO>,
-        op_count: u32,
-        payload_size: usize,
         commit_ts: u64,
-        mut running_crc: u32,
-    ) -> Result<PayloadParseResult> {
-        let mut parsed_ops = Vec::with_capacity((op_count as usize).min(1024));
-        let mut payload_bytes_read: u64 = 0;
+        payload_bytes_read: &mut usize,
+    ) -> Result<IOResult<Option<ParsedOp>>> {
+        let empty = || Ok(IOResult::Done(None));
 
-        for _ in 0..op_count {
-            // Op header (6 bytes): tag(1) | flags(1) | table_id(4, little-endian i32)
-            let op_bytes = match self.try_consume_fixed::<6>(io)? {
-                Some(bytes) => bytes,
-                None => return Ok(PayloadParseResult::Eof),
-            };
-            running_crc = crc32c::crc32c_append(running_crc, &op_bytes);
-            let tag = op_bytes[0];
-            let flags = op_bytes[1];
-            let table_id_i32 =
-                i32::from_le_bytes([op_bytes[2], op_bytes[3], op_bytes[4], op_bytes[5]]);
-            let table_id = match tag {
-                OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
-                    if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
-                        return Err(LimboError::Corrupt(format!(
-                            "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
-                        )));
-                    }
-                    Some(MVTableId::from(table_id_i32 as i64))
-                }
-                OP_UPDATE_HEADER => {
-                    if flags != 0 || table_id_i32 != 0 {
-                        return Err(LimboError::Corrupt(format!(
-                            "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
-                        )));
-                    }
-                    None
-                }
-                _ => {
-                    return Err(LimboError::Corrupt(format!("unknown op tag {tag}")));
-                }
-            };
-            let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
-
-            let (payload_len, payload_len_bytes, payload_len_bytes_len) =
-                match self.consume_varint_bytes(io) {
-                    Ok(Some((value, bytes, len))) => (value, bytes, len),
-                    Ok(None) => return Ok(PayloadParseResult::Eof),
-                    Err(err) => return Err(err),
-                };
-            running_crc =
-                crc32c::crc32c_append(running_crc, &payload_len_bytes[..payload_len_bytes_len]);
-            let payload_len = usize::try_from(payload_len)
-                .map_err(|e| LimboError::Corrupt(format!("payload_len overflows usize: {e}")))?;
-
-            let payload = match self.try_consume_bytes(io, payload_len)? {
-                Some(bytes) => bytes,
-                None => return Ok(PayloadParseResult::Eof),
-            };
-            running_crc = crc32c::crc32c_append(running_crc, &payload);
-
-            let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
-            payload_bytes_read = u64::try_from(op_total_bytes)
-                .ok()
-                .and_then(|op_size| payload_bytes_read.checked_add(op_size))
-                .ok_or_else(|| LimboError::Corrupt("payload_bytes_read overflow".to_string()))?;
-
-            let parsed_op = match tag {
-                OP_UPSERT_TABLE => {
-                    let table_id = table_id.expect("table op must carry table id");
-                    let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
-                        LimboError::Corrupt(format!(
-                            "failed to read rowid varint in upsert op: {e}"
-                        ))
-                    })?;
-                    let rowid_i64 = rowid_u64 as i64;
-                    if rowid_len > payload.len() {
-                        return Err(LimboError::Corrupt(
-                            "upsert op rowid varint extends beyond payload".to_string(),
-                        ));
-                    }
-                    let mut payload = payload;
-                    let record_bytes = payload.split_off(rowid_len);
-                    let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
-                    ParsedOp::UpsertTable {
-                        table_id,
-                        rowid,
-                        record_bytes,
-                        commit_ts,
-                        btree_resident,
-                    }
-                }
-                OP_DELETE_TABLE => {
-                    let table_id = table_id.expect("table op must carry table id");
-                    let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
-                        LimboError::Corrupt(format!(
-                            "failed to read rowid varint in delete op: {e}"
-                        ))
-                    })?;
-                    if rowid_len != payload.len() {
-                        return Err(LimboError::Corrupt(format!(
-                            "delete op rowid varint len {rowid_len} != payload len {}",
-                            payload.len()
-                        )));
-                    }
-                    let rowid_i64 = rowid_u64 as i64;
-                    let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
-                    ParsedOp::DeleteTable {
-                        rowid,
-                        commit_ts,
-                        btree_resident,
-                    }
-                }
-                OP_UPSERT_INDEX => {
-                    let table_id = table_id.expect("index op must carry table id");
-                    ParsedOp::UpsertIndex {
-                        table_id,
-                        payload,
-                        commit_ts,
-                        btree_resident,
-                    }
-                }
-                OP_DELETE_INDEX => {
-                    let table_id = table_id.expect("index op must carry table id");
-                    ParsedOp::DeleteIndex {
-                        table_id,
-                        payload,
-                        commit_ts,
-                        btree_resident,
-                    }
-                }
-                OP_UPDATE_HEADER => {
-                    if payload.len() != DatabaseHeader::SIZE {
-                        return Err(LimboError::Corrupt(format!(
-                            "OP_UPDATE_HEADER payload len {} != DatabaseHeader::SIZE {}",
-                            payload.len(),
-                            DatabaseHeader::SIZE
-                        )));
-                    }
-                    let mut bytes = [0u8; DatabaseHeader::SIZE];
-                    bytes.copy_from_slice(&payload);
-                    let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
-                    if header.magic != *b"SQLite format 3\0" {
-                        return Err(LimboError::Corrupt(
-                            "OP_UPDATE_HEADER has invalid SQLite magic".to_string(),
-                        ));
-                    }
-                    ParsedOp::UpdateHeader { header, commit_ts }
-                }
-                _ => {
+        // Op header (6 bytes): tag(1) | flags(1) | table_id(4, little-endian i32)
+        let op_bytes = match self.try_consume_fixed::<6>(io)? {
+            Some(bytes) => bytes,
+            None => return empty(),
+        };
+        self.running_crc = crc32c::crc32c_append(self.running_crc, &op_bytes);
+        let tag = op_bytes[0];
+        let flags = op_bytes[1];
+        let table_id_i32 = i32::from_le_bytes([op_bytes[2], op_bytes[3], op_bytes[4], op_bytes[5]]);
+        let table_id = match tag {
+            OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX => {
+                if flags & !OP_FLAG_BTREE_RESIDENT != 0 || table_id_i32 >= 0 {
                     return Err(LimboError::Corrupt(format!(
-                        "unknown op tag {tag} in payload"
+                        "invalid op flags={flags:#x} or table_id={table_id_i32} for tag={tag}"
                     )));
                 }
-            };
-
-            parsed_ops.push(parsed_op);
-        }
-
-        if payload_size as u64 != payload_bytes_read {
-            return Err(LimboError::Corrupt(format!(
-                "payload_size ({payload_size}) != payload_bytes_read ({payload_bytes_read})"
-            )));
-        }
-
-        Ok(PayloadParseResult::Ok(parsed_ops, running_crc))
-    }
-
-    fn parse_next_transaction(&mut self, io: &Arc<dyn crate::IO>) -> Result<ParseResult> {
-        if self.remaining_bytes() < TX_MIN_FRAME_SIZE {
-            return Ok(ParseResult::Eof);
-        }
-        let frame_start = self.offset.saturating_sub(self.bytes_can_read());
-
-        let header_bytes = match self.try_consume_fixed::<TX_HEADER_SIZE>(io)? {
-            Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
+                Some(MVTableId::from(table_id_i32 as i64))
+            }
+            OP_UPDATE_HEADER => {
+                if flags != 0 || table_id_i32 != 0 {
+                    return Err(LimboError::Corrupt(format!(
+                        "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
+                    )));
+                }
+                None
+            }
+            _ => {
+                return Err(LimboError::Corrupt(format!("unknown op tag {tag}")));
+            }
         };
+        let btree_resident = (flags & OP_FLAG_BTREE_RESIDENT) != 0;
 
-        // TX HEADER layout (24 bytes): FRAME_MAGIC(4) | payload_size(8) | op_count(4) | commit_ts(8)
-        let frame_magic = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        if frame_magic != FRAME_MAGIC {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
-        let payload_size_u64 = u64::from_le_bytes([
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
-        ]);
-        let op_count = u32::from_le_bytes([
-            header_bytes[12],
-            header_bytes[13],
-            header_bytes[14],
-            header_bytes[15],
-        ]);
-        let commit_ts = u64::from_le_bytes([
-            header_bytes[16],
-            header_bytes[17],
-            header_bytes[18],
-            header_bytes[19],
-            header_bytes[20],
-            header_bytes[21],
-            header_bytes[22],
-            header_bytes[23],
-        ]);
+        let (payload_len, payload_len_bytes, payload_len_bytes_len) =
+            match self.consume_varint_bytes(io) {
+                Ok(Some((value, bytes, len))) => (value, bytes, len),
+                Ok(None) => return empty(),
+                Err(err) => return Err(err),
+            };
+        self.running_crc = crc32c::crc32c_append(
+            self.running_crc,
+            &payload_len_bytes[..payload_len_bytes_len],
+        );
+        let payload_len = usize::try_from(payload_len)
+            .map_err(|e| LimboError::Corrupt(format!("payload_len overflows usize: {e}")))?;
 
-        let payload_size = match usize::try_from(payload_size_u64) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("payload_size overflows usize: {e}");
-                self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
+        let payload = match self.try_consume_bytes(io, payload_len)? {
+            Some(bytes) => bytes,
+            None => return empty(),
+        };
+        self.running_crc = crc32c::crc32c_append(self.running_crc, &payload);
+
+        let op_total_bytes = 6 + payload_len_bytes_len + payload_len;
+        *payload_bytes_read = u64::try_from(op_total_bytes)
+            .ok()
+            .and_then(|op_size| payload_bytes_read.checked_add(op_size as usize))
+            .ok_or_else(|| LimboError::Corrupt("payload_bytes_read overflow".to_string()))?;
+
+        let parsed_op = match tag {
+            OP_UPSERT_TABLE => {
+                let table_id = table_id.expect("table op must carry table id");
+                let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
+                    LimboError::Corrupt(format!("failed to read rowid varint in upsert op: {e}"))
+                })?;
+                let rowid_i64 = rowid_u64 as i64;
+                if rowid_len > payload.len() {
+                    return Err(LimboError::Corrupt(
+                        "upsert op rowid varint extends beyond payload".to_string(),
+                    ));
+                }
+                let mut payload = payload;
+                let record_bytes = payload.split_off(rowid_len);
+                let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
+                ParsedOp::UpsertTable {
+                    table_id,
+                    rowid,
+                    record_bytes,
+                    commit_ts: commit_ts,
+                    btree_resident,
+                }
+            }
+            OP_DELETE_TABLE => {
+                let table_id = table_id.expect("table op must carry table id");
+                let (rowid_u64, rowid_len) = read_varint(&payload).map_err(|e| {
+                    LimboError::Corrupt(format!("failed to read rowid varint in delete op: {e}"))
+                })?;
+                if rowid_len != payload.len() {
+                    return Err(LimboError::Corrupt(format!(
+                        "delete op rowid varint len {rowid_len} != payload len {}",
+                        payload.len()
+                    )));
+                }
+                let rowid_i64 = rowid_u64 as i64;
+                let rowid = RowID::new(table_id, RowKey::Int(rowid_i64));
+                ParsedOp::DeleteTable {
+                    rowid,
+                    commit_ts: commit_ts,
+                    btree_resident,
+                }
+            }
+            OP_UPSERT_INDEX => {
+                let table_id = table_id.expect("index op must carry table id");
+                ParsedOp::UpsertIndex {
+                    table_id,
+                    payload,
+                    commit_ts: commit_ts,
+                    btree_resident,
+                }
+            }
+            OP_DELETE_INDEX => {
+                let table_id = table_id.expect("index op must carry table id");
+                ParsedOp::DeleteIndex {
+                    table_id,
+                    payload,
+                    commit_ts: commit_ts,
+                    btree_resident,
+                }
+            }
+            OP_UPDATE_HEADER => {
+                if payload.len() != DatabaseHeader::SIZE {
+                    return Err(LimboError::Corrupt(format!(
+                        "OP_UPDATE_HEADER payload len {} != DatabaseHeader::SIZE {}",
+                        payload.len(),
+                        DatabaseHeader::SIZE
+                    )));
+                }
+                let mut bytes = [0u8; DatabaseHeader::SIZE];
+                bytes.copy_from_slice(&payload);
+                let header = *bytemuck::from_bytes::<DatabaseHeader>(&bytes);
+                if header.magic != *b"SQLite format 3\0" {
+                    return Err(LimboError::Corrupt(
+                        "OP_UPDATE_HEADER has invalid SQLite magic".to_string(),
+                    ));
+                }
+                ParsedOp::UpdateHeader {
+                    header,
+                    commit_ts: commit_ts,
+                }
+            }
+            _ => {
+                return Err(LimboError::Corrupt(format!(
+                    "unknown op tag {tag} in payload"
+                )));
             }
         };
 
-        // Chained CRC: seed from running_crc (derived from salt, or previous frame's CRC)
-        let running_crc = crc32c::crc32c_append(self.running_crc, &header_bytes);
+        Ok(IOResult::Done(Some(parsed_op)))
+    }
+
+    fn parse_next_record(&mut self, io: &Arc<dyn crate::IO>) -> Result<IOResult<ParsedOp>> {
+        let StreamingState::ParsingRecord {
+            mut payload_bytes_read,
+            header_bytes,
+            frame_info,
+            record_idx,
+        } = std::mem::replace(&mut self.state, StreamingState::Finished)
+        else {
+            return Err(LimboError::InternalError(
+                "unexpected state in parse_next_record".to_string(),
+            ));
+        };
 
         // 2. Parse payload — branches for encrypted vs unencrypted.
         //    Corrupt errors from payload parsing are treated as an invalid frame
         //    (stop scanning, keep previously validated frames).
-        let (parsed_ops, running_crc) = match if self.encryption_ctx.is_some() {
-            self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
+        let parsed_op = match if self.encryption_ctx.is_some() {
+            todo!()
+            // self.parse_encrypted_payload(io, op_count, payload_size, commit_ts, running_crc)
         } else {
-            self.parse_streaming_payload(io, op_count, payload_size, commit_ts, running_crc)
+            //TODO this is ugly, it's confusing to know which function is in charge of managing the state,
+            // and there's even a bug here! Since I'm replacing the state at the beginning of parse_next_record,
+            // parse_op doesn't have a state!
+            //
+            // Maybe I could use the typestate pattern and have a Placeholder state variant.
+            self.parse_op(io, frame_info.commit_ts, &mut payload_bytes_read)
         } {
-            Ok(PayloadParseResult::Ok(ops, crc)) => (ops, crc),
-            Ok(PayloadParseResult::Eof) => return Ok(ParseResult::Eof),
+            Ok(IOResult::Done(Some(parsed_op))) => parsed_op,
+            Ok(IOResult::IO(completions)) => return Ok(IOResult::IO(completions)),
             Err(LimboError::Corrupt(msg)) => {
                 tracing::warn!("corrupt payload: {msg}");
-                self.last_valid_offset = frame_start;
-                return Ok(ParseResult::InvalidFrame);
+                self.last_valid_offset = frame_info.start;
+                self.state = StreamingState::Finished;
+                return_empty!(self);
             }
+            Ok(IOResult::Done(None)) => return_empty!(self),
             Err(e) => return Err(e),
         };
 
-        // 3. TX TRAILER layout (8 bytes): crc32c(4, le u32) | END_MAGIC(4)
-        let trailer_bytes = match self.try_consume_fixed::<TX_TRAILER_SIZE>(io)? {
-            Some(bytes) => bytes,
-            None => return Ok(ParseResult::Eof),
+        self.state = if record_idx < frame_info.op_count as usize {
+            StreamingState::ParsingRecord {
+                record_idx,
+                payload_bytes_read,
+                header_bytes,
+                frame_info,
+            }
+        } else {
+            StreamingState::ParsingFrameTrailer {
+                frame_info,
+                payload_bytes_read,
+            }
         };
 
-        let crc32c_expected = u32::from_le_bytes([
-            trailer_bytes[0],
-            trailer_bytes[1],
-            trailer_bytes[2],
-            trailer_bytes[3],
-        ]);
-        let end_magic = u32::from_le_bytes([
-            trailer_bytes[4],
-            trailer_bytes[5],
-            trailer_bytes[6],
-            trailer_bytes[7],
-        ]);
-
-        if crc32c_expected != running_crc {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
-        if end_magic != END_MAGIC {
-            self.last_valid_offset = frame_start;
-            return Ok(ParseResult::InvalidFrame);
-        }
-
-        self.last_valid_offset = self.offset.saturating_sub(self.bytes_can_read());
-        // Advance the chain: this frame's CRC becomes the seed for the next frame.
-        self.running_crc = running_crc;
-        Ok(ParseResult::Ops(parsed_ops))
+        Ok(IOResult::Done(parsed_op))
     }
 
     pub(crate) fn parsed_op_to_streaming(
@@ -2204,10 +2331,10 @@ struct EncryptedPayloadReadContext {
 
 /// Result of parsing just the payload portion of a transaction frame.
 /// Used by `parse_encrypted_payload` and `parse_streaming_payload` to communicate
-/// back to `parse_next_transaction` without duplicating control flow.
+/// back to `next_frame` without duplicating control flow.
 ///
 /// Corruption is signalled via `Err(LimboError::Corrupt(...))`, not a variant here.
-/// The caller (`parse_next_transaction`) catches those errors and converts them to
+/// The caller (`next_frame`) catches those errors and converts them to
 /// `ParseResult::InvalidFrame` to preserve the WAL-prefix "stop scanning" semantics.
 enum PayloadParseResult {
     /// Successfully parsed ops and updated running CRC.
